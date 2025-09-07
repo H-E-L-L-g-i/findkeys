@@ -1,5 +1,3 @@
-# find_ssh_gpg_keys/core.py
-
 import logging
 import shutil
 import sys
@@ -26,14 +24,13 @@ from .config import (
 
 def display_progress(stats: ScanStats, stop_event: threading.Event):
     """
-    Функция, работающая в отдельном потоке для отображения прогресса.
-    Обновляет одну строку в консоли сводной информацией.
+    Displays progress in a separate thread.
+    Updates a single line in the console with summary information.
     """
     spinner_chars = ['|', '/', '-', '\\']
     spinner_index = 0
 
     while not stop_event.is_set():
-        # Получаем текущий символ для спиннера
         spinner_char = spinner_chars[spinner_index]
         spinner_index = (spinner_index + 1) % len(spinner_chars)
 
@@ -42,7 +39,6 @@ def display_progress(stats: ScanStats, stop_event: threading.Event):
         warn_str = ", ".join(
             [f"{k}: {v}" for k, v in warn_items]) if warn_items else "None"
 
-        # Добавляем спиннер в начало строки состояния
         status_line = (
             f"[{spinner_char}] "
             f"Dirs scanned: {summary['scanned']:,} | "
@@ -58,10 +54,8 @@ def display_progress(stats: ScanStats, stop_event: threading.Event):
     sys.stdout.flush()
 
 
-# --- Остальной код в файле core.py остается без изменений ---
-
 def should_skip_dir(dir_path: Path, exclude_dirs: Optional[Set[str]] = None) -> bool:
-    """Проверяет, следует ли пропустить директорию."""
+    """Checks if a directory should be skipped."""
     path_parts = {part.lower() for part in dir_path.parts}
     if any(skip_dir.lower() in path_parts for skip_dir in SYSTEM_DIRS_TO_SKIP):
         return True
@@ -70,6 +64,88 @@ def should_skip_dir(dir_path: Path, exclude_dirs: Optional[Set[str]] = None) -> 
     if exclude_dirs and dir_path.name.lower() in exclude_dirs:
         return True
     return False
+
+
+def is_valid_key_dir(dir_path: Path) -> bool:
+    """
+    Checks if a directory contains at least one file or subdirectory
+    that matches the patterns for key files. This helps to filter out
+    directories that have the right name (e.g., 'gnupg') but don't
+    contain actual keys (e.g., only socket files).
+    """
+    try:
+        for entry in dir_path.iterdir():
+            # For directories, match patterns ending with '/'
+            if entry.is_dir():
+                if any(fnmatch.fnmatch(entry.name + "/", pat) for pat in INCLUDE_KEY_PATTERNS):
+                    return True
+            # For files, match file patterns
+            else:
+                if any(fnmatch.fnmatch(entry.name, pat) for pat in INCLUDE_KEY_PATTERNS):
+                    return True
+    except OSError as e:
+        logging.warning(f"Could not validate directory content of {dir_path}: {e}")
+        return False  # If we can't read it, we can't validate it.
+
+    return False
+
+
+def _process_directory(
+        entry: Path,
+        target_dirs: Set[str],
+        exclude_dirs: Set[str],
+        stats: ScanStats
+) -> bool:
+    """
+    Processes a single directory entry. Adds to stats if it's a valid key dir.
+    Returns True if the directory should be queued for deeper scanning.
+    """
+    if should_skip_dir(entry, exclude_dirs):
+        return False
+
+    if entry.name.lower() in target_dirs:
+        if is_valid_key_dir(entry):
+            stats.add_found_key(entry)
+        else:
+            logging.info(f"Skipping '{entry}' as it doesn't contain recognizable key files.")
+        return False  # It's a target, don't scan deeper
+
+    return True  # Not a target, queue for deeper scan
+
+
+def _scan_sequentially(
+        tasks: List[Path], max_depth: int, target_dirs: Set[str],
+        exclude_dirs: Set[str], stats: ScanStats, current_abs_depth: int,
+        parallel: bool, max_workers: int
+):
+    """Handles recursive scanning sequentially."""
+    for task in tasks:
+        scan_for_target_dirs(
+            task, max_depth, target_dirs, exclude_dirs, stats,
+            current_abs_depth, parallel, max_workers
+        )
+
+
+def _scan_in_parallel(
+        tasks: List[Path], max_depth: int, target_dirs: Set[str],
+        exclude_dirs: Set[str], stats: ScanStats, current_abs_depth: int,
+        parallel: bool, max_workers: int
+):
+    """Handles recursive scanning in parallel."""
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        futures = {
+            executor.submit(
+                scan_for_target_dirs,
+                task, max_depth, target_dirs, exclude_dirs, stats,
+                current_abs_depth, parallel, max_workers
+            ) for task in tasks
+        }
+        for future in as_completed(futures):
+            try:
+                future.result()
+            except Exception as e:
+                stats.add_warning("Scan Error")
+                logging.error(f"Error in parallel task: {e}")
 
 
 def scan_for_target_dirs(
@@ -83,84 +159,76 @@ def scan_for_target_dirs(
         max_workers: int = 8,
 ):
     """
-    Рекурсивно сканирует директории, обновляя объект статистики.
+    Recursively scans directories, updating the statistics object.
     """
     stats.increment_scanned()
-
-    if current_abs_depth > max_depth:
+    if current_abs_depth >= max_depth:
         return
 
     try:
         entries = [entry for entry in start_path.iterdir() if entry.is_dir()]
-        entries = filter_dirs(entries, exclude_dirs)
+        processable_entries = filter_dirs(entries, exclude_dirs)
 
         sub_tasks = []
-        for entry in entries:
-            if should_skip_dir(entry, exclude_dirs):
-                continue
-            if entry.name.lower() in target_dirs:
-                stats.add_found_key(entry)
-            else:
+        for entry in processable_entries:
+            if _process_directory(entry, target_dirs, exclude_dirs, stats):
                 sub_tasks.append(entry)
 
-        if current_abs_depth < max_depth:
-            if parallel:
-                with ThreadPoolExecutor(max_workers=max_workers) as executor:
-                    futures = {
-                        executor.submit(
-                            scan_for_target_dirs,
-                            task, max_depth, target_dirs, exclude_dirs, stats,
-                            current_abs_depth + 1, parallel, max_workers
-                        ) for task in sub_tasks
-                    }
-                    for future in as_completed(futures):
-                        try:
-                            future.result()
-                        except Exception as e:
-                            stats.add_warning("Scan Error")
-                            logging.error(f"Error in parallel task: {e}")
-            else:
-                for task in sub_tasks:
-                    scan_for_target_dirs(
-                        task, max_depth, target_dirs, exclude_dirs, stats,
-                        current_abs_depth + 1, parallel, max_workers
-                    )
-    except (PermissionError, OSError):
+        if not sub_tasks:
+            return
+
+        scan_args = (
+            sub_tasks, max_depth, target_dirs, exclude_dirs, stats,
+            current_abs_depth + 1, parallel, max_workers
+        )
+        if parallel:
+            _scan_in_parallel(*scan_args)
+        else:
+            _scan_sequentially(*scan_args)
+    except OSError:
         stats.add_warning("Access Denied")
     except Exception:
         stats.add_warning("Read Error")
 
 
-def copy_and_archive(
+def _get_ignore_func(only_key_files: bool):
+    """
+    Factory to create the ignore function for shutil.copytree based on copy mode.
+    """
+
+    def ignore_by_inclusion(root, names):
+        """Ignore files and dirs NOT matching INCLUDE_KEY_PATTERNS."""
+        ignored = set()
+        for name in names:
+            path_obj = Path(root) / name
+            # Add trailing slash for directories to match patterns like "private-keys-v*/"
+            match_name = name + "/" if path_obj.is_dir() else name
+            is_included = any(fnmatch.fnmatch(match_name, pat) for pat in INCLUDE_KEY_PATTERNS)
+            if not is_included:
+                ignored.add(name)
+        return list(ignored)
+
+    def ignore_by_exclusion(_, names):
+        """Ignore files matching EXCLUDE_FILE_PATTERNS."""
+        ignored_names = []
+        for name in names:
+            if any(fnmatch.fnmatch(name, pat) for pat in EXCLUDE_FILE_PATTERNS):
+                ignored_names.append(name)
+        return ignored_names
+
+    return ignore_by_inclusion if only_key_files else ignore_by_exclusion
+
+
+def _copy_found_dirs(
         found_dirs: List[Path],
-        output_base_dir: Path,
-        show_progress: bool = False,
-        no_archive: bool = False,
-        only_key_files: bool = False,
-        dry_run: bool = False,
-) -> Tuple[Path, Optional[Path]]:
-    """Копирует найденные директории и создаёт архив."""
-    output_dir_path = output_base_dir / f"found_keys_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
-    if not dry_run:
-        output_dir_path.mkdir(parents=True, exist_ok=True)
-
-    def ignore_logic(_, names):
-        ignored_names = set()
-        if only_key_files:
-            for name in names:
-                is_key_file = any(
-                    fnmatch.fnmatch(name, pat) for pat in INCLUDE_KEY_PATTERNS)
-                if not is_key_file:
-                    ignored_names.add(name)
-        else:
-            for name in names:
-                if any(fnmatch.fnmatch(name, pat) for pat in EXCLUDE_FILE_PATTERNS):
-                    ignored_names.add(name)
-        return list(ignored_names)
-
-    iterator = tqdm(found_dirs, desc="Copying keys",
-                    unit="dir") if show_progress else found_dirs
+        output_dir_path: Path,
+        ignore_func,
+        show_progress: bool,
+        dry_run: bool,
+) -> Tuple[int, int]:
+    """Copies directories from found_dirs to output_dir_path, returning counts."""
     copied_count, skipped_count = 0, 0
+    iterator = tqdm(found_dirs, desc="Copying keys", unit="dir") if show_progress else found_dirs
 
     for idx, folder in enumerate(iterator):
         dest_name = f"{folder.parent.name.replace(':', '')}_{folder.name}_{idx}"
@@ -171,25 +239,60 @@ def copy_and_archive(
             continue
 
         try:
-            shutil.copytree(folder, dest, ignore=ignore_logic, dirs_exist_ok=True)
+            shutil.copytree(folder, dest, ignore=ignore_func, dirs_exist_ok=True)
             logging.info(f"Copied '{folder}' to '{dest}'")
             copied_count += 1
-        except (OSError, IOError) as e:
+        except OSError as e:
             logging.error(f"Failed to copy '{folder}': {e}")
             skipped_count += 1
 
+    return copied_count, skipped_count
+
+
+def _create_archive(
+        output_dir_path: Path,
+        show_progress: bool,
+) -> Optional[Path]:
+    """Creates a zip archive of the given directory."""
+    if show_progress:
+        print("Creating archive...")
+
+    try:
+        archive_file_str = shutil.make_archive(
+            base_name=str(output_dir_path),
+            format="zip",
+            root_dir=output_dir_path
+        )
+        archive_file = Path(archive_file_str)
+        logging.info(f"Archive created: {archive_file}")
+        return archive_file
+    except Exception as e:
+        logging.error(f"Failed to create archive: {e}")
+        return None
+
+
+def copy_and_archive(
+        found_dirs: List[Path],
+        output_base_dir: Path,
+        show_progress: bool = False,
+        no_archive: bool = False,
+        only_key_files: bool = False,
+        dry_run: bool = False,
+) -> Tuple[Path, Optional[Path]]:
+    """Copies the found directories and creates an archive."""
+    output_dir_path = output_base_dir / f"found_keys_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+    if not dry_run:
+        output_dir_path.mkdir(parents=True, exist_ok=True)
+
+    ignore_func = _get_ignore_func(only_key_files)
+
+    copied_count, skipped_count = _copy_found_dirs(
+        found_dirs, output_dir_path, ignore_func, show_progress, dry_run
+    )
+
     archive_file = None
     if not no_archive and not dry_run and copied_count > 0:
-        if show_progress:
-            print(f"Creating archive...")
-        archive_base_name = output_dir_path
-        try:
-            archive_file_str = shutil.make_archive(str(archive_base_name), "zip",
-                                                   root_dir=output_dir_path)
-            archive_file = Path(archive_file_str)
-            logging.info(f"Archive created: {archive_file}")
-        except Exception as e:
-            logging.error(f"Failed to create archive: {e}")
+        archive_file = _create_archive(output_dir_path, show_progress)
 
     logging.info(
         f"Scan complete. Found: {len(found_dirs)}, Copied: {copied_count}, Skipped: {skipped_count}.")
@@ -209,7 +312,7 @@ def find_and_archive_keys(
         only_key_files: bool,
         dry_run: bool,
 ) -> Tuple[Path, Optional[Path]]:
-    """Основная функция для поиска и архивации ключей."""
+    """The main function for finding and archiving keys."""
     stats = ScanStats()
     stop_event = threading.Event()
     display_thread = None
@@ -221,10 +324,9 @@ def find_and_archive_keys(
         display_thread.start()
 
     scan_paths = drives
-    target_dirs_set = set(t.lower() for t in target_dirs)
+    target_dirs_set = {t.lower() for t in target_dirs}
 
-    # Создаем пул потоков для каждого диска
-    # Ограничим количество одновременных потоков для дисков, чтобы не перегружать систему
+    # Limit the number of concurrent threads for drives to avoid overloading the system
     drive_workers = min(len(scan_paths), 4)
     with ThreadPoolExecutor(max_workers=drive_workers,
                             thread_name_prefix='drive_scanner') as executor:
@@ -235,7 +337,6 @@ def find_and_archive_keys(
                 logging.warning(f"Drive {drive_path} does not exist, skipping.")
                 continue
 
-            # Каждое сканирование диска - это отдельная задача
             future = executor.submit(
                 scan_for_target_dirs,
                 start_path=drive_path,
@@ -243,15 +344,15 @@ def find_and_archive_keys(
                 target_dirs=target_dirs_set,
                 exclude_dirs=exclude_dirs,
                 stats=stats,
-                parallel=parallel,  # Внутренняя параллелизация для папок
+                parallel=parallel,
                 max_workers=max_workers,
             )
             futures.append(future)
 
-        # Ожидаем завершения сканирования всех дисков
+        # Wait for all drive scans to complete
         for future in as_completed(futures):
             try:
-                future.result()  # Получаем результат, чтобы отловить возможные ошибки
+                future.result()  # Get the result to catch potential errors
             except Exception as e:
                 stats.add_warning("Drive Scan Error")
                 logging.error(f"A critical error occurred during drive scan: {e}",
